@@ -31,7 +31,7 @@ docker compose exec -T backend python -m scripts.seed_demo
 |---|---|
 | frontend | 原生 HTML / CSS / JS ES Modules，Nginx代理 `/api/` |
 | backend | Python3.11 / FastAPI / SQLAlchemy / JWT |
-| worker | 独立Python进程，Redis BLPOP队列，持久化结果/CSV/心跳 |
+| worker | 独立Python进程，Redis BLPOP队列 + 数据库租约，持久化结果/CSV/心跳 |
 | db | MySQL8，命名卷持久化 |
 | redis | Redis7，AOF命名卷 |
 
@@ -66,7 +66,16 @@ Exhibition / VisitorRating / RecommendationRun / CuratorSelection 是核心实�
 
 访客均值中心化的余弦相似度，仅使用正相似邻居；每位访客留一评分验证，留出评分不进入训练。无邻居时回退展品均值。
 
-失败态：业务字段缺失/非有限数值、参数越界、样本不足、退化特征或结构错误均明确拒绝或将任务标failed，错误消息保存在任务中。可回到来源或配置修正后重新执行，历史失败记录保留。
+失败态：业务字段缺失/非有限数值、参数越界、样本不足、退化特征或结构错误均明确拒绝或将任务标failed，错误消息保存在任务中。业务坏数据是终态，不会自动重试；可回到来源或配置修正后重新执行，历史失败记录保留。
+
+### 调度、租约与留档
+
+- 状态机：`queued`（待算）→ `running`（执行中）→ `completed`（已完成）；执行者失联、执行中断或留档不完整时进入 `recovering`（恢复中），由调度自动补投。业务坏数据进入 `failed`（已终止）。
+- 受理持久化：任务先落库再投递。Redis 暂时不可用时任务保持 `queued`，队列恢复后由调度补投；重复投递无害，领取时以数据库状态为准。
+- 租约与 fencing：领取任务写入 `lease_owner`/`lease_token`/`lease_expires_at`；执行者定期续租并写心跳。租约到期后其他执行者可以接管，旧持有者的结果提交、留档发布、完成标记与文件写入都会因令牌不符被拒绝。
+- 冻结输入：计算与恢复始终使用受理时冻结的 `snapshot.records` 与 `parameters`，来源后续修改不影响历史任务。
+- 结果与留档：先提交结果及其 SHA256，再以原子替换写入 CSV 留档并记录校验和、大小与令牌；重启恢复时若已有逐字节相同的留档则直接采用，不重复发布。`completed` 仅在结果、留档齐备且内容相符时标记，下载前再次校验；校验失败会回到 `recovering` 自动补齐。
+- 业务说明仍只能基于通过校验的已完成结果创建，批准快照导出逻辑保持不变。
 
 已知边界：显式1–5评分，不是隐式行为推荐；按展品代码确定性留一，不能当作时间外推验证。相似度只取正值，至少两个共同评分；回退会显示依据。生产建议在完成评估后用全量已知评分，不将训练评分误报验证。
 
@@ -102,7 +111,10 @@ backend/migrations/001_initial.sql
 | JWT_SECRET | `.env.example`演示值，部署前修改 |
 | DATABASE_URL / REDIS_URL | Compose内部连接，定义在compose的env锚点 |
 | ARTIFACT_DIR | `/artifacts`，后端worker共享 |
+| RUN_QUEUE_KEY / RUN_LEASE_SECONDS | `analysis:queue` / `30`，队列键与租约时长 |
+| RUN_HEARTBEAT_SECONDS / RUN_DISPATCH_SECONDS | `5` / `5`，续租与补投扫描间隔 |
+| RUN_DISPATCH_GRACE_SECONDS / RUN_MAX_ATTEMPTS | `10` / `8`，补投宽限与最大自动恢复次数 |
 
-共享枚举：`backend/src/constants/enums.py` 与 `frontend/src/constants/enums.js` 都定义 admin/analyst/viewer、queued/running/completed/failed、draft/approved。后端service检查对应字符串；README为全量值说明。共享前端组件table/status/chart/business跨总览、结果、配置与复核复用；actions hook和format utils负责交互/格式。后端errors与rate_limit是两个中间件。
+共享枚举：`backend/src/constants/enums.py` 与 `frontend/src/constants/enums.js` 都定义 admin/analyst/viewer、queued/running/recovering/completed/failed、draft/approved。后端service检查对应字符串；README为全量值说明。共享前端组件table/status/chart/business跨总览、结果、配置与复核复用；actions hook和format utils负责交互/格式。后端errors与rate_limit是两个中间件。
 
-测试及截图在批根 `test-artifacts/gb-0045/`，不混入源码。独立算法oracle、HTTP完整流程和真实Playwright浏览器流程见该目录 `TESTING.md`。License：MIT。
+后端故障场景测试位于 `backend/tests/`（`python3 -m pytest`）：队列中断后补投、冻结快照、并发领取唯一胜者、租约接管与旧持有者 fencing、留档中断补齐、重试幂等、完成门禁、坏数据终止。测试及截图在批根 `test-artifacts/gb-0045/`，不混入源码。独立算法oracle、HTTP完整流程和真实Playwright浏览器流程见该目录 `TESTING.md`。License：MIT。

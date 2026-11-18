@@ -1,6 +1,6 @@
 import json,random,logging
 from sqlalchemy import select,func
-from src.config.database import Base,engine,Session
+from src.config.database import ensure_schema,Session
 from src.config.settings import CONFIG
 from src.models.user import User
 from src.models.source import Source
@@ -9,7 +9,7 @@ from src.models.run import Run
 from src.models import note,audit
 from src.utils.security import hash_password
 from src.utils.serialization import now
-from src.services.runs import queue
+from src.services.runs import enqueue
 from src.services.domain_validation import validate_record
 
 def seed_values(kind,index,batch,rng):
@@ -33,7 +33,7 @@ def seed_values(kind,index,batch,rng):
 def counts(db):
     return {cls.__tablename__:db.scalar(select(func.count()).select_from(cls)) for cls in (User,Source,Record,Run)}
 def seed():
-    Base.metadata.create_all(engine);rng=random.Random(42);queued=[]
+    ensure_schema();rng=random.Random(42);queued=[]
     with Session() as db:
         for role in ('admin','analyst','viewer'):
             email=role+'@'+CONFIG['slug']+'.demo'
@@ -54,6 +54,6 @@ def seed():
                 run=Run(source_id=source.id,name='首轮种子研究',state='queued',parameters=CONFIG['default_parameters'],snapshot={'source':{'id':source.id,'name':source.name,'filename':source.filename},'records':records},created_at=now());db.add(run);db.flush();queued.append(run.id)
         db.commit();print(json.dumps(counts(db),ensure_ascii=False))
     for id in queued:
-        try:queue.rpush('analysis:queue',id)
-        except Exception:logging.exception('seed queue unavailable')
+        with Session() as db:
+            enqueue(db,id)
 if __name__=='__main__':seed()
